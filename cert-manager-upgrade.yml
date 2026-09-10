@@ -117,39 +117,15 @@ NS:.metadata.namespace,NAME:.metadata.name,READY:'.status.conditions[?(@.type=="
 
 
 
-helm uninstall cert-manager -n cert-manager --debug 2>&1 | tail -30
+helm repo add jetstack https://charts.jetstack.io
+helm repo update
 
-helm get manifest cert-manager -n cert-manager | grep -E '^apiVersion:' | sort -u
+helm install cert-manager jetstack/cert-manager \
+  --namespace cert-manager --create-namespace \
+  --version v1.21.1 \
+  --set crds.enabled=true \
+  --set crds.keep=true \
+  --wait --timeout 10m
 
-# 1. what does the release own?
-helm get manifest cert-manager -n cert-manager | grep -E '^kind:|^  name:' | paste - - | sort -u
-
-# 2. drop the release record so helm forgets it
-kubectl get secret -n cert-manager -l owner=helm
-kubectl delete secret -n cert-manager sh.helm.release.v1.cert-manager.v1
-
-# 3. namespace-scoped resources go with the namespace
-kubectl delete ns cert-manager
-
-# 4. cluster-scoped leftovers — list before deleting
-kubectl get clusterrole,clusterrolebinding | grep cert-manager
-
-kubectl delete $(kubectl get clusterrole,clusterrolebinding -o name | grep cert-manager | tr '\n' ' ')
-
-kubectl delete crd $(kubectl get crd -o name | grep 'cert-manager.io' | cut -d/ -f2)
-
-kubectl delete clusterrole <names from above>
-kubectl delete clusterrolebinding <names from above>
-
-kubectl get apiservice | grep cert-manager
-kubectl delete apiservice v1beta1.webhook.cert-manager.io 2>/dev/null
-
-# 5. CRDs last
-kubectl delete crd $(kubectl get crd -o name | grep 'cert-manager.io' | cut -d/ -f2)
-
-kubectl get ns cert-manager
-kubectl get crd | grep cert-manager
-kubectl get clusterrole,clusterrolebinding,apiservice -A | grep cert-manager
-helm list -A | grep cert-manager
-
-grep -nE 'keySize|keyAlgorithm|keyEncoding|organization|emailSANs|uriSANs' "$BK"/*-v1.yaml
+helm template cert-manager jetstack/cert-manager --version v1.21.1 \
+  --set crds.enabled=true | grep -E '^\s+image:'
