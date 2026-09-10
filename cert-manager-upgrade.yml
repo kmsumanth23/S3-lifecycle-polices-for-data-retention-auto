@@ -50,16 +50,17 @@ grep -nE 'keySize|keyAlgorithm|keyEncoding|organization|emailSANs|uriSANs' *-v1.
 
 phase 3
 
-helm uninstall cert-manager -n cert-manager
-
-kubectl delete crd $(kubectl get crd -o name | grep 'cert-manager.io' | cut -d/ -f2)
-
-# stale webhooks block ALL admission if left behind — this is the usual cause of
-# "Internal error occurred: failed calling webhook" after a bad migration
-kubectl delete mutatingwebhookconfiguration cert-manager-webhook 2>/dev/null
+# FIRST — a ValidatingWebhookConfiguration with failurePolicy: Fail plus a dead
+# webhook pod blocks every create/update/delete of cert-manager resources,
+# including helm uninstall
+kubectl get validatingwebhookconfiguration,mutatingwebhookconfiguration | grep cert-manager
 kubectl delete validatingwebhookconfiguration cert-manager-webhook 2>/dev/null
-kubectl delete apiservice v1beta1.webhook.cert-manager.io 2>/dev/null
+kubectl delete mutatingwebhookconfiguration cert-manager-webhook 2>/dev/null
 
+# then the rest
+helm uninstall cert-manager -n cert-manager
+kubectl delete crd $(kubectl get crd -o name | grep 'cert-manager.io' | cut -d/ -f2)
+kubectl delete apiservice v1beta1.webhook.cert-manager.io 2>/dev/null
 kubectl delete ns cert-manager
 
 
