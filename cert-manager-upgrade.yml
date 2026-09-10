@@ -133,6 +133,11 @@ kubectl delete ns cert-manager
 
 # 4. cluster-scoped leftovers — list before deleting
 kubectl get clusterrole,clusterrolebinding | grep cert-manager
+
+kubectl delete $(kubectl get clusterrole,clusterrolebinding -o name | grep cert-manager | tr '\n' ' ')
+
+kubectl delete crd $(kubectl get crd -o name | grep 'cert-manager.io' | cut -d/ -f2)
+
 kubectl delete clusterrole <names from above>
 kubectl delete clusterrolebinding <names from above>
 
