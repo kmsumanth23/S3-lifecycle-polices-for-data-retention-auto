@@ -38,13 +38,12 @@ ls -la "$BK"
 
 Phase 2 — Convert manifests to v1
 cd "$BK"
-for f in certificates.yaml issuers.yaml clusterissuers.yaml; do
+for f in certificates.yaml issuers.yaml; do
   sed -e 's|cert-manager.io/v1alpha2|cert-manager.io/v1|g' \
       -e 's|cert-manager.io/v1alpha3|cert-manager.io/v1|g' \
       -e 's|cert-manager.io/v1beta1|cert-manager.io/v1|g' \
       "$f" > "${f%.yaml}-v1.yaml"
 done
-
 
 grep -nE 'keySize|keyAlgorithm|keyEncoding|organization|emailSANs|uriSANs' *-v1.yaml
 
