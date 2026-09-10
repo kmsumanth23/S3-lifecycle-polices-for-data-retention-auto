@@ -1,0 +1,115 @@
+Phase 0 — Assess (do not skip)
+
+kubectl version
+helm version
+helm list -A | grep -i cert-manager
+kubectl get crd | grep cert-manager
+kubectl get deploy -n cert-manager -o jsonpath='{.items[*].spec.template.spec.containers[*].image}'; echo
+
+# CRITICAL: if this returns anything, deleting Certificates WILL delete the TLS secrets
+kubectl get deploy -n cert-manager -o yaml | grep -i 'enable-certificate-owner-ref'
+
+# nothing should be near expiry during the window
+kubectl get certificate -A -o custom-columns=\
+NS:.metadata.namespace,NAME:.metadata.name,READY:'.status.conditions[?(@.type=="Ready")].status',EXPIRY:.status.notAfter
+
+
+phase 1backup
+BK=/apps/<client_code>/<client_env>/utils/cert-manager/backup-$(date +%Y%m%d-%H%M%S)
+mkdir -p "$BK"
+
+for k in certificates issuers clusterissuers certificaterequests orders challenges; do
+  kubectl get "$k" -A -o yaml > "$BK/$k.yaml" 2>/dev/null
+done
+
+kubectl get crd -o name | grep 'cert-manager.io' | xargs -r kubectl get -o yaml > "$BK/crds.yaml"
+helm get values cert-manager -n cert-manager > "$BK/old-values.yaml" 2>/dev/null
+
+# the actual TLS material — your real safety net
+kubectl get certificate -A \
+  -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.spec.secretName}{"\n"}{end}' \
+| while read -r ns s; do
+    kubectl get secret "$s" -n "$ns" -o yaml >> "$BK/tls-secrets.yaml" 2>/dev/null
+    echo "---" >> "$BK/tls-secrets.yaml"
+  done
+
+ls -la "$BK"
+
+
+Phase 2 — Convert manifests to v1
+cd "$BK"
+for f in certificates.yaml issuers.yaml clusterissuers.yaml; do
+  sed -e 's|cert-manager.io/v1alpha2|cert-manager.io/v1|g' \
+      -e 's|cert-manager.io/v1alpha3|cert-manager.io/v1|g' \
+      -e 's|cert-manager.io/v1beta1|cert-manager.io/v1|g' \
+      "$f" > "${f%.yaml}-v1.yaml"
+done
+
+
+grep -nE 'keySize|keyAlgorithm|keyEncoding|organization|emailSANs|uriSANs' *-v1.yaml
+
+
+phase 3
+
+helm uninstall cert-manager -n cert-manager
+
+kubectl delete crd $(kubectl get crd -o name | grep 'cert-manager.io' | cut -d/ -f2)
+
+# stale webhooks block ALL admission if left behind — this is the usual cause of
+# "Internal error occurred: failed calling webhook" after a bad migration
+kubectl delete mutatingwebhookconfiguration cert-manager-webhook 2>/dev/null
+kubectl delete validatingwebhookconfiguration cert-manager-webhook 2>/dev/null
+kubectl delete apiservice v1beta1.webhook.cert-manager.io 2>/dev/null
+
+kubectl delete ns cert-manager
+
+
+phase 4
+
+STAGE=/apps/<client_code>/<client_env>/utils/cert-manager/v1.21.1
+mkdir -p "$STAGE" && cd "$STAGE"
+
+# same object the automation pulls
+gsutil cp gs://gss-bucket-image-repo/repo/downloads/cert-manager/cert-manager-v1.21.1.tgz .
+tar xzf cert-manager-v1.21.1.tgz
+
+kubectl create namespace cert-manager
+
+# recreate the pull secret — the automation does this via registry-image-pull-secret.yml
+kubectl create secret docker-registry hclnow-internal-repo \
+  --docker-server=<tools_image_registry> \
+  --docker-username=<user> --docker-password=<pass> \
+  -n cert-manager
+
+cat > values.yaml <<'EOF'
+imageRegistry: <tools_image_registry>
+imageNamespace: cert-manager
+global:
+  imagePullSecrets:
+    - name: hclnow-internal-repo
+crds:
+  enabled: true
+  keep: true
+EOF
+
+# confirm images resolve to the internal registry before installing
+helm template cert-manager ./cert-manager -f values.yaml | grep -E '^\s+image:'
+
+helm install cert-manager ./cert-manager \
+  -n cert-manager -f values.yaml --wait --timeout 10m
+
+
+phase 5
+
+cd "$BK"
+kubectl apply -f clusterissuers-v1.yaml
+kubectl apply -f issuers-v1.yaml
+kubectl apply -f certificates-v1.yaml
+
+
+phase 6
+
+kubectl get pods -n cert-manager
+kubectl get clusterissuer,issuer -A
+kubectl get certificate -A -o custom-columns=\
+NS:.metadata.namespace,NAME:.metadata.name,READY:'.status.conditions[?(@.type=="Ready")].status'
