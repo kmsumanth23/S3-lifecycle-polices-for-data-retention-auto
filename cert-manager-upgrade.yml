@@ -136,3 +136,10 @@ helm install cert-manager jetstack/cert-manager \
 
 helm template cert-manager jetstack/cert-manager --version v1.21.1 \
   --set crds.enabled=true | grep -E '^\s+image:'
+
+kubectl get secret belk-np-tools-tls -n git-jenkins
+kubectl get certificate belk-np-cert -n git-jenkins -o jsonpath='{.status.notAfter}'; echo
+
+# the actual point of all this
+curl -vI https://git.np.belk.now.hclsoftware.cloud 2>&1 | grep -E 'subject|issuer|expire'
+curl -vI https://jenkins.np.belk.now.hclsoftware.cloud 2>&1 | grep -E 'subject|issuer|expire'
