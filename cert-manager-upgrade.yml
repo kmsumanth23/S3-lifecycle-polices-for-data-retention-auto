@@ -102,9 +102,16 @@ helm install cert-manager ./cert-manager \
 phase 5
 
 cd "$BK"
-kubectl apply -f clusterissuers-v1.yaml
+kubectl apply -f issuers-v1.yaml --dry-run=server
+kubectl apply -f certificates-v1.yaml --dry-run=server
+sed -i -E '/^\s+(resourceVersion|uid|creationTimestamp|generation|selfLink):/d' \
+  issuers-v1.yaml certificates-v1.yaml
 kubectl apply -f issuers-v1.yaml
 kubectl apply -f certificates-v1.yaml
+kubectl get crd certificates.cert-manager.io -o jsonpath='{.spec.versions[*].name}'; echo
+kubectl describe certificate belk-np-cert -n git-jenkins
+kubectl describe issuer -n git-jenkins
+kubectl logs -n cert-manager deploy/cert-manager --tail=100
 
 
 phase 6
