@@ -1,0 +1,42 @@
+# hclnow-config-client-environments/clients/hxsa/awsv9m/aws-client-vars-env.yml
+#
+# Add s3_lifecycle_manage and the per-bucket lifecycle_rules keys.
+# Buckets with no lifecycle key are left completely untouched.
+
+s3_lifecycle_manage: true
+
+client_buckets:
+  - name: "{{ client_env }}-dailyjob"
+    description: "Daily job bucket"
+    location: "{{ aws_region }}"
+    lifecycle_rules:
+      - id: expire-noncurrent-versions
+        status: Enabled
+        noncurrent_version_expiration_days: 60
+
+  - name: "{{ client_env }}-dataload"
+    description: "Data Load bucket"
+    location: "{{ aws_region }}"
+    lifecycle_rules:
+      - id: transition-to-ia
+        status: Enabled
+        prefix: data/
+        transitions:
+          - days: 30
+            storage_class: STANDARD_IA
+          - days: 90
+            storage_class: GLACIER
+        expiration_days: 365
+      - id: cleanup-incomplete-uploads
+        status: Enabled
+        abort_incomplete_multipart_upload_days: 7
+
+  - name: "{{ client_env }}-velero"
+    description: "Data bucket for velerobackups"
+    location: "{{ aws_region }}"
+    lifecycle_rules: []
+
+  - name: "{{ client_env }}-donotdelete"
+    description: "donotdelete bucket"
+    location: "{{ aws_region }}"
+    lifecycle_rules: []

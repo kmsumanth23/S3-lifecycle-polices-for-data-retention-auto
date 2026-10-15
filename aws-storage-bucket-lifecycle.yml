@@ -1,0 +1,297 @@
+---
+- name: Manage the S3 bucket lifecycle configuration
+  when: s3_lifecycle_manage | default(false) | bool
+  run_once: true
+  tags:
+    - bucket
+    - s3-lifecycle
+  block:
+
+    - name: Resolve the lifecycle rules declared for this bucket
+      set_fact:
+        s3_lifecycle_rules_resolved: "{{ bucket_info.lifecycle_rules
+                                         if (bucket_info.lifecycle_rules is defined)
+                                         else (s3_lifecycle_rules_default
+                                               if (bucket_info.lifecycle_use_default | default(false) | bool)
+                                               else []) }}"
+        s3_lifecycle_purge_requested: "{{ bucket_info.lifecycle_purge | default(false) | bool }}"
+        s3_lifecycle_doc_path: "{{ tmp_directory }}/s3-lifecycle-{{ bucket_name }}.json"
+
+    - name: Decide whether this bucket has anything to apply
+      set_fact:
+        s3_lifecycle_apply: "{{ (s3_lifecycle_rules_resolved | length > 0)
+                                or s3_lifecycle_purge_requested }}"
+
+    - name: Report that the bucket is not under lifecycle management
+      debug:
+        msg: "{{ bucket_name }}: no lifecycle rules declared, bucket left untouched"
+      when: not s3_lifecycle_apply
+
+    - name: Apply the lifecycle configuration
+      when: s3_lifecycle_apply
+      block:
+
+        - name: Validate the declared lifecycle rule set
+          assert:
+            that:
+              - s3_lifecycle_rules_resolved is sequence
+              - s3_lifecycle_rules_resolved | rejectattr('id', 'defined') | list | length == 0
+              - s3_lifecycle_rules_resolved | map(attribute='id') | map('string')
+                | select('eq', '') | list | length == 0
+              - s3_lifecycle_rules_resolved | map(attribute='id') | unique | list | length
+                == s3_lifecycle_rules_resolved | length
+              - s3_lifecycle_rules_resolved | map(attribute='id') | map('string')
+                | map('length') | select('gt', s3_lifecycle_rule_id_max_length | int)
+                | list | length == 0
+            fail_msg: >-
+              Lifecycle rules for {{ bucket_name }} are malformed. Every rule needs an 'id'
+              that is non-empty, unique within the bucket and at most
+              {{ s3_lifecycle_rule_id_max_length }} characters. Fix lifecycle_rules under
+              this bucket in the client aws-client-vars-env.yml.
+            success_msg: "{{ s3_lifecycle_rules_resolved | length }} rule(s) structurally valid"
+
+        - name: Validate each lifecycle rule
+          assert:
+            that:
+              - item.status | default('Enabled') in ['Enabled', 'Disabled']
+              - (item.expiration_days is defined)
+                or (item.transitions is defined)
+                or (item.noncurrent_version_expiration_days is defined)
+                or (item.noncurrent_version_transitions is defined)
+                or (item.abort_incomplete_multipart_upload_days is defined)
+              - item.transitions | default([])
+                | rejectattr('storage_class', 'in', s3_lifecycle_valid_storage_classes)
+                | list | length == 0
+              - item.noncurrent_version_transitions | default([])
+                | rejectattr('storage_class', 'in', s3_lifecycle_valid_storage_classes)
+                | list | length == 0
+              - item.transitions | default([])
+                | selectattr('storage_class', 'in', s3_lifecycle_ia_storage_classes)
+                | selectattr('days', 'lt', s3_lifecycle_ia_min_days | int)
+                | list | length == 0
+              - transition_days == transition_days | sort
+              - transition_days | unique | list | length == transition_days | length
+              - (item.expiration_days is not defined)
+                or (transition_days | length == 0)
+                or (item.expiration_days | int > transition_days | max)
+            fail_msg: >-
+              Lifecycle rule '{{ item.id | default("<no id>") }}' on {{ bucket_name }} is invalid.
+              Check: status is Enabled or Disabled; the rule has at least one action;
+              every storage_class is one of {{ s3_lifecycle_valid_storage_classes | join(', ') }};
+              transitions to {{ s3_lifecycle_ia_storage_classes | join('/') }} are at least
+              {{ s3_lifecycle_ia_min_days }} days; transition days strictly ascending;
+              expiration_days greater than every transition day.
+          loop: "{{ s3_lifecycle_rules_resolved }}"
+          loop_control:
+            label: "{{ item.id | default('<no id>') }}"
+          vars:
+            transition_days: "{{ item.transitions | default([]) | map(attribute='days')
+                                 | map('int') | list }}"
+
+        - name: Read the lifecycle configuration currently on the bucket
+          shell: >-
+            {{ s3_lifecycle_aws_cli }} s3api get-bucket-lifecycle-configuration
+            --bucket {{ bucket_name | quote }}
+            --output json
+          register: s3_lifecycle_current
+          failed_when: false
+          changed_when: false
+          become: true
+          become_user: root
+          become_method: su
+          become_exe: sudo su -
+          environment:
+            AWS_ACCESS_KEY_ID: "{{ assumed_role.sts_creds.access_key }}"
+            AWS_SECRET_ACCESS_KEY: "{{ assumed_role.sts_creds.secret_key }}"
+            AWS_SESSION_TOKEN: "{{ assumed_role.sts_creds.session_token }}"
+            AWS_DEFAULT_REGION: "{{ aws_region }}"
+
+        - name: Confirm the current lifecycle configuration was read and not merely unreadable
+          assert:
+            that:
+              - (s3_lifecycle_current.rc == 0)
+                or ('NoSuchLifecycleConfiguration' in (s3_lifecycle_current.stderr | default('')))
+            fail_msg: >-
+              Could not read the current lifecycle configuration for {{ bucket_name }}
+              (rc={{ s3_lifecycle_current.rc }}). Treating that as "no rules exist" would risk
+              silently deleting rules that are actually on the bucket, so this task refuses to
+              continue. Check the aws CLI path ({{ s3_lifecycle_aws_cli }}) and that the
+              assumed role holds s3:GetLifecycleConfiguration.
+              aws stderr: {{ s3_lifecycle_current.stderr | default('') | trim }}
+
+        - name: Identify lifecycle rules on the bucket that the client config does not declare
+          set_fact:
+            s3_lifecycle_existing_ids: "{{ existing_ids }}"
+            s3_lifecycle_unmanaged_ids: "{{ existing_ids
+                                            | difference(s3_lifecycle_rules_resolved
+                                                         | map(attribute='id') | list) }}"
+          vars:
+            existing_ids: "{{ (s3_lifecycle_current.stdout | from_json).Rules
+                              | map(attribute='ID') | list
+                              if (s3_lifecycle_current.rc == 0
+                                  and s3_lifecycle_current.stdout | trim | length > 0)
+                              else [] }}"
+
+        - name: Refuse to overwrite lifecycle rules that are absent from the client config
+          fail:
+            msg: >-
+              {{ bucket_name }} already carries lifecycle rule(s)
+              {{ s3_lifecycle_unmanaged_ids | join(', ') }} that the client config does not
+              declare. Applying this configuration would delete them. Either add those rules
+              to lifecycle_rules for this bucket in the client aws-client-vars-env.yml, or set
+              lifecycle_adopt: true on this bucket to discard them deliberately.
+          when:
+            - s3_lifecycle_unmanaged_ids | length > 0
+            - not (bucket_info.lifecycle_adopt | default(false) | bool)
+
+        - name: Render the lifecycle configuration document
+          set_fact:
+            s3_lifecycle_document: |-
+              {
+                "Rules": [
+              {% for r in s3_lifecycle_rules_resolved %}
+                  {
+                    "ID": {{ r.id | to_json }},
+                    "Status": {{ r.status | default('Enabled') | to_json }},
+                    "Filter": {% if r.prefix is defined %}{"Prefix": {{ r.prefix | to_json }}}{% else %}{}{% endif %}
+              {% if r.expiration_days is defined %}
+                    ,"Expiration": {"Days": {{ r.expiration_days | int }}}
+              {% endif %}
+              {% if r.transitions is defined %}
+                    ,"Transitions": [
+              {% for t in r.transitions %}
+                      {"Days": {{ t.days | int }}, "StorageClass": {{ t.storage_class | to_json }}}{{ "," if not loop.last else "" }}
+              {% endfor %}
+                    ]
+              {% endif %}
+              {% if r.noncurrent_version_expiration_days is defined %}
+                    ,"NoncurrentVersionExpiration": {"NoncurrentDays": {{ r.noncurrent_version_expiration_days | int }}}
+              {% endif %}
+              {% if r.noncurrent_version_transitions is defined %}
+                    ,"NoncurrentVersionTransitions": [
+              {% for t in r.noncurrent_version_transitions %}
+                      {"NoncurrentDays": {{ t.days | int }}, "StorageClass": {{ t.storage_class | to_json }}}{{ "," if not loop.last else "" }}
+              {% endfor %}
+                    ]
+              {% endif %}
+              {% if r.abort_incomplete_multipart_upload_days is defined %}
+                    ,"AbortIncompleteMultipartUpload": {"DaysAfterInitiation": {{ r.abort_incomplete_multipart_upload_days | int }}}
+              {% endif %}
+                  }{{ "," if not loop.last else "" }}
+              {% endfor %}
+                ]
+              }
+
+        - name: Normalise the rendered document and verify it is well formed
+          set_fact:
+            s3_lifecycle_document_json: "{{ s3_lifecycle_document | from_json | to_nice_json }}"
+          when: s3_lifecycle_rules_resolved | length > 0
+
+        - name: Verify the rendered document matches the declared rule set
+          assert:
+            that:
+              - (s3_lifecycle_document_json | from_json).Rules | length
+                == s3_lifecycle_rules_resolved | length
+            fail_msg: >-
+              The rendered lifecycle document for {{ bucket_name }} did not parse back to the
+              declared rule count. This is an automation defect, not a config error.
+          when: s3_lifecycle_rules_resolved | length > 0
+
+        - name: Show the lifecycle configuration that would be applied
+          debug:
+            msg: "{{ ([bucket_name ~ ': would apply'] + s3_lifecycle_document_json.split('\n'))
+                     if s3_lifecycle_rules_resolved | length > 0
+                     else [bucket_name ~ ': would DELETE the entire lifecycle configuration'] }}"
+          when: s3_lifecycle_check_only | default(false) | bool
+
+        - name: Apply the lifecycle configuration to the bucket
+          when: not (s3_lifecycle_check_only | default(false) | bool)
+          block:
+
+            - name: Write the lifecycle configuration document to the host
+              copy:
+                content: "{{ s3_lifecycle_document_json }}"
+                dest: "{{ s3_lifecycle_doc_path }}"
+                mode: "0600"
+              when: s3_lifecycle_rules_resolved | length > 0
+
+            - name: Put the lifecycle configuration on the bucket
+              shell: >-
+                {{ s3_lifecycle_aws_cli }} s3api put-bucket-lifecycle-configuration
+                --bucket {{ bucket_name | quote }}
+                --lifecycle-configuration {{ ('file://' ~ s3_lifecycle_doc_path) | quote }}
+              become: true
+              become_user: root
+              become_method: su
+              become_exe: sudo su -
+              environment:
+                AWS_ACCESS_KEY_ID: "{{ assumed_role.sts_creds.access_key }}"
+                AWS_SECRET_ACCESS_KEY: "{{ assumed_role.sts_creds.secret_key }}"
+                AWS_SESSION_TOKEN: "{{ assumed_role.sts_creds.session_token }}"
+                AWS_DEFAULT_REGION: "{{ aws_region }}"
+              when: s3_lifecycle_rules_resolved | length > 0
+
+            - name: Delete the lifecycle configuration from the bucket
+              shell: >-
+                {{ s3_lifecycle_aws_cli }} s3api delete-bucket-lifecycle
+                --bucket {{ bucket_name | quote }}
+              become: true
+              become_user: root
+              become_method: su
+              become_exe: sudo su -
+              environment:
+                AWS_ACCESS_KEY_ID: "{{ assumed_role.sts_creds.access_key }}"
+                AWS_SECRET_ACCESS_KEY: "{{ assumed_role.sts_creds.secret_key }}"
+                AWS_SESSION_TOKEN: "{{ assumed_role.sts_creds.session_token }}"
+                AWS_DEFAULT_REGION: "{{ aws_region }}"
+              when:
+                - s3_lifecycle_rules_resolved | length == 0
+                - s3_lifecycle_purge_requested
+
+            - name: Read the lifecycle configuration back from the bucket
+              shell: >-
+                {{ s3_lifecycle_aws_cli }} s3api get-bucket-lifecycle-configuration
+                --bucket {{ bucket_name | quote }}
+                --output json
+              register: s3_lifecycle_readback
+              failed_when: false
+              changed_when: false
+              become: true
+              become_user: root
+              become_method: su
+              become_exe: sudo su -
+              environment:
+                AWS_ACCESS_KEY_ID: "{{ assumed_role.sts_creds.access_key }}"
+                AWS_SECRET_ACCESS_KEY: "{{ assumed_role.sts_creds.secret_key }}"
+                AWS_SESSION_TOKEN: "{{ assumed_role.sts_creds.session_token }}"
+                AWS_DEFAULT_REGION: "{{ aws_region }}"
+
+            - name: Confirm AWS is serving exactly the declared rule set
+              assert:
+                that:
+                  - (s3_lifecycle_readback.rc == 0)
+                    or ('NoSuchLifecycleConfiguration' in (s3_lifecycle_readback.stderr | default('')))
+                  - readback_ids | sort == (s3_lifecycle_rules_resolved
+                                            | map(attribute='id') | list | sort)
+                fail_msg: >-
+                  Verification failed for {{ bucket_name }} (read-back rc={{ s3_lifecycle_readback.rc }},
+                  stderr: {{ s3_lifecycle_readback.stderr | default('') | trim }}).
+                  AWS reports lifecycle rules {{ readback_ids | join(', ') | default('none', true) }}
+                  but the client config declares
+                  {{ s3_lifecycle_rules_resolved | map(attribute='id') | join(', ') | default('none', true) }}.
+                  The put was accepted but AWS is not serving what was sent. Inspect with:
+                  aws s3api get-bucket-lifecycle-configuration --bucket {{ bucket_name }}
+                success_msg: >-
+                  {{ bucket_name }}: AWS is serving {{ readback_ids | length }} rule(s)
+                  ({{ readback_ids | join(', ') | default('none', true) }})
+              vars:
+                readback_ids: "{{ (s3_lifecycle_readback.stdout | from_json).Rules
+                                  | map(attribute='ID') | list
+                                  if (s3_lifecycle_readback.rc == 0
+                                      and s3_lifecycle_readback.stdout | trim | length > 0)
+                                  else [] }}"
+
+            - name: Remove the rendered lifecycle configuration document from the host
+              file:
+                path: "{{ s3_lifecycle_doc_path }}"
+                state: absent
