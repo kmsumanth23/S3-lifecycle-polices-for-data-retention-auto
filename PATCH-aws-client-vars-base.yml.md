@@ -34,4 +34,6 @@ s3_lifecycle_ia_storage_classes:
 s3_lifecycle_ia_min_days: 30
 s3_lifecycle_rule_id_max_length: 255
 grep -c "{{ bucket_name }}" aws-client-infra-provision-core/tasks/aws-storage-bucket-lifecycle.yml   # must be 0
+aws s3api get-bucket-lifecycle-configuration --bucket <bucket> \
+  --query 'Rules[].{ID:ID,Prefix:Filter.Prefix,Expire:Expiration.Days}' --output table
 ```
