@@ -1,7 +1,13 @@
-# hclnow-config-client-environments/clients/hxsa/awsv9m/aws-client-vars-env.yml
+# TEST PHASE config - hclnow-config-client-environments/clients/hxsa/awsv9m/aws-client-vars-env.yml
 #
-# Add s3_lifecycle_manage and the per-bucket lifecycle_rules keys.
-# Buckets with no lifecycle key are left completely untouched.
+# Short-horizon values so behaviour is observable in 24-48h instead of 30 days.
+# Swap back to your production values AFTER the tests pass.
+#
+# Covers all three of Person 1's requirements:
+#   1. rule applied to a bucket            -> dailyjob test-expire-all-1d
+#   2. delete logs after a period          -> dataload test-expire-us-east-1-logs-1d
+#   3. selective to one folder             -> same rule + the decoys in the runbook
+# Plus the delete-marker lesson            -> dailyjob test-expire-noncurrent-1d
 
 s3_lifecycle_manage: true
 
@@ -10,26 +16,24 @@ client_buckets:
     description: "Daily job bucket"
     location: "{{ aws_region }}"
     lifecycle_rules:
-      - id: expire-noncurrent-versions
+      - id: test-expire-all-1d
         status: Enabled
-        noncurrent_version_expiration_days: 60
+        expiration_days: 1
+      - id: test-expire-noncurrent-1d
+        status: Enabled
+        noncurrent_version_expiration_days: 1
 
   - name: "{{ client_env }}-dataload"
     description: "Data Load bucket"
     location: "{{ aws_region }}"
     lifecycle_rules:
-      - id: transition-to-ia
+      - id: test-expire-us-east-1-logs-1d
         status: Enabled
-        prefix: data/
-        transitions:
-          - days: 30
-            storage_class: STANDARD_IA
-          - days: 90
-            storage_class: GLACIER
-        expiration_days: 365
-      - id: cleanup-incomplete-uploads
+        prefix: logs/us-east-1/
+        expiration_days: 1
+      - id: test-cleanup-incomplete-uploads
         status: Enabled
-        abort_incomplete_multipart_upload_days: 7
+        abort_incomplete_multipart_upload_days: 1
 
   - name: "{{ client_env }}-velero"
     description: "Data bucket for velerobackups"
