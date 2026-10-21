@@ -17,6 +17,7 @@ empty by default, overridden per client.
 # S3 bucket lifecycle policy defaults
 # Feature is off until a client sets s3_lifecycle_manage: true
 s3_lifecycle_manage: false
+s3_bucket_name_prefix: "hclsw-hss-bkt-"
 s3_lifecycle_check_only: false
 s3_lifecycle_rules_default: []
 s3_lifecycle_aws_cli: /usr/local/bin/aws
