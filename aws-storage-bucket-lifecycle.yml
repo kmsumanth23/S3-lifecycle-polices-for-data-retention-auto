@@ -222,9 +222,9 @@
 
         - name: Show the lifecycle configuration that would be applied
           debug:
-            msg: "{{ ([bucket_name ~ ': would apply'] + s3_lifecycle_document_json.split('\n'))
+            msg: "{{ ([s3_lifecycle_bucket_name ~ ': would apply'] + s3_lifecycle_document_json.split('\n'))
                      if s3_lifecycle_rules_resolved | length > 0
-                     else [bucket_name ~ ': would DELETE the entire lifecycle configuration'] }}"
+                     else [s3_lifecycle_bucket_name ~ ': would DELETE the entire lifecycle configuration'] }}"
           when: s3_lifecycle_check_only | default(false) | bool
 
         - name: Apply the lifecycle configuration to the bucket
