@@ -7,6 +7,12 @@
     - s3-lifecycle
   block:
 
+    - name: Derive the bucket name for this lifecycle run
+      set_fact:
+        s3_lifecycle_bucket_name: "{{ (s3_bucket_name_prefix + client_code + '-' + bucket_info.name)
+                                      if (bucket_info.alt_prefix is not defined)
+                                      else (bucket_info.alt_prefix + bucket_info.name) }}"
+
     - name: Resolve the lifecycle rules declared for this bucket
       set_fact:
         s3_lifecycle_rules_resolved: "{{ bucket_info.lifecycle_rules
@@ -15,7 +21,7 @@
                                                if (bucket_info.lifecycle_use_default | default(false) | bool)
                                                else []) }}"
         s3_lifecycle_purge_requested: "{{ bucket_info.lifecycle_purge | default(false) | bool }}"
-        s3_lifecycle_doc_path: "{{ tmp_directory }}/s3-lifecycle-{{ bucket_name }}.json"
+        s3_lifecycle_doc_path: "{{ tmp_directory }}/s3-lifecycle-{{ s3_lifecycle_bucket_name }}.json"
 
     - name: Decide whether this bucket has anything to apply
       set_fact:
@@ -24,12 +30,29 @@
 
     - name: Report that the bucket is not under lifecycle management
       debug:
-        msg: "{{ bucket_name }}: no lifecycle rules declared, bucket left untouched"
+        msg: "{{ s3_lifecycle_bucket_name }}: no lifecycle rules declared, bucket left untouched"
       when: not s3_lifecycle_apply
 
     - name: Apply the lifecycle configuration
       when: s3_lifecycle_apply
       block:
+
+        - name: Locate the aws CLI on the host running the lifecycle tasks
+          stat:
+            path: "{{ s3_lifecycle_aws_cli }}"
+          register: s3_lifecycle_cli
+          changed_when: false
+
+        - name: Confirm the aws CLI is present before touching any bucket
+          assert:
+            that:
+              - s3_lifecycle_cli.stat.exists
+            fail_msg: >-
+              {{ s3_lifecycle_aws_cli }} was not found on {{ inventory_hostname }}, which is
+              the host run_once selected for the lifecycle tasks. No bucket has been changed.
+              Either install the CLI there, override s3_lifecycle_aws_cli with the correct
+              path, or run these tasks on the control node instead.
+            quiet: true
 
         - name: Validate the declared lifecycle rule set
           assert:
@@ -44,7 +67,7 @@
                 | map('length') | select('gt', s3_lifecycle_rule_id_max_length | int)
                 | list | length == 0
             fail_msg: >-
-              Lifecycle rules for {{ bucket_name }} are malformed. Every rule needs an 'id'
+              Lifecycle rules for {{ s3_lifecycle_bucket_name }} are malformed. Every rule needs an 'id'
               that is non-empty, unique within the bucket and at most
               {{ s3_lifecycle_rule_id_max_length }} characters. Fix lifecycle_rules under
               this bucket in the client aws-client-vars-env.yml.
@@ -75,7 +98,7 @@
                 or (transition_days | length == 0)
                 or (item.expiration_days | int > transition_days | max)
             fail_msg: >-
-              Lifecycle rule '{{ item.id | default("<no id>") }}' on {{ bucket_name }} is invalid.
+              Lifecycle rule '{{ item.id | default("<no id>") }}' on {{ s3_lifecycle_bucket_name }} is invalid.
               Check: status is Enabled or Disabled; the rule has at least one action;
               every storage_class is one of {{ s3_lifecycle_valid_storage_classes | join(', ') }};
               transitions to {{ s3_lifecycle_ia_storage_classes | join('/') }} are at least
@@ -91,7 +114,7 @@
         - name: Read the lifecycle configuration currently on the bucket
           shell: >-
             {{ s3_lifecycle_aws_cli }} s3api get-bucket-lifecycle-configuration
-            --bucket {{ bucket_name | quote }}
+            --bucket {{ s3_lifecycle_bucket_name | quote }}
             --output json
           register: s3_lifecycle_current
           failed_when: false
@@ -112,7 +135,7 @@
               - (s3_lifecycle_current.rc == 0)
                 or ('NoSuchLifecycleConfiguration' in (s3_lifecycle_current.stderr | default('')))
             fail_msg: >-
-              Could not read the current lifecycle configuration for {{ bucket_name }}
+              Could not read the current lifecycle configuration for {{ s3_lifecycle_bucket_name }}
               (rc={{ s3_lifecycle_current.rc }}). Treating that as "no rules exist" would risk
               silently deleting rules that are actually on the bucket, so this task refuses to
               continue. Check the aws CLI path ({{ s3_lifecycle_aws_cli }}) and that the
@@ -135,7 +158,7 @@
         - name: Refuse to overwrite lifecycle rules that are absent from the client config
           fail:
             msg: >-
-              {{ bucket_name }} already carries lifecycle rule(s)
+              {{ s3_lifecycle_bucket_name }} already carries lifecycle rule(s)
               {{ s3_lifecycle_unmanaged_ids | join(', ') }} that the client config does not
               declare. Applying this configuration would delete them. Either add those rules
               to lifecycle_rules for this bucket in the client aws-client-vars-env.yml, or set
@@ -193,7 +216,7 @@
               - (s3_lifecycle_document_json | from_json).Rules | length
                 == s3_lifecycle_rules_resolved | length
             fail_msg: >-
-              The rendered lifecycle document for {{ bucket_name }} did not parse back to the
+              The rendered lifecycle document for {{ s3_lifecycle_bucket_name }} did not parse back to the
               declared rule count. This is an automation defect, not a config error.
           when: s3_lifecycle_rules_resolved | length > 0
 
@@ -218,7 +241,7 @@
             - name: Put the lifecycle configuration on the bucket
               shell: >-
                 {{ s3_lifecycle_aws_cli }} s3api put-bucket-lifecycle-configuration
-                --bucket {{ bucket_name | quote }}
+                --bucket {{ s3_lifecycle_bucket_name | quote }}
                 --lifecycle-configuration {{ ('file://' ~ s3_lifecycle_doc_path) | quote }}
               become: true
               become_user: root
@@ -234,7 +257,7 @@
             - name: Delete the lifecycle configuration from the bucket
               shell: >-
                 {{ s3_lifecycle_aws_cli }} s3api delete-bucket-lifecycle
-                --bucket {{ bucket_name | quote }}
+                --bucket {{ s3_lifecycle_bucket_name | quote }}
               become: true
               become_user: root
               become_method: su
@@ -251,7 +274,7 @@
             - name: Read the lifecycle configuration back from the bucket
               shell: >-
                 {{ s3_lifecycle_aws_cli }} s3api get-bucket-lifecycle-configuration
-                --bucket {{ bucket_name | quote }}
+                --bucket {{ s3_lifecycle_bucket_name | quote }}
                 --output json
               register: s3_lifecycle_readback
               failed_when: false
@@ -274,15 +297,15 @@
                   - readback_ids | sort == (s3_lifecycle_rules_resolved
                                             | map(attribute='id') | list | sort)
                 fail_msg: >-
-                  Verification failed for {{ bucket_name }} (read-back rc={{ s3_lifecycle_readback.rc }},
+                  Verification failed for {{ s3_lifecycle_bucket_name }} (read-back rc={{ s3_lifecycle_readback.rc }},
                   stderr: {{ s3_lifecycle_readback.stderr | default('') | trim }}).
                   AWS reports lifecycle rules {{ readback_ids | join(', ') | default('none', true) }}
                   but the client config declares
                   {{ s3_lifecycle_rules_resolved | map(attribute='id') | join(', ') | default('none', true) }}.
                   The put was accepted but AWS is not serving what was sent. Inspect with:
-                  aws s3api get-bucket-lifecycle-configuration --bucket {{ bucket_name }}
+                  aws s3api get-bucket-lifecycle-configuration --bucket {{ s3_lifecycle_bucket_name }}
                 success_msg: >-
-                  {{ bucket_name }}: AWS is serving {{ readback_ids | length }} rule(s)
+                  {{ s3_lifecycle_bucket_name }}: AWS is serving {{ readback_ids | length }} rule(s)
                   ({{ readback_ids | join(', ') | default('none', true) }})
               vars:
                 readback_ids: "{{ (s3_lifecycle_readback.stdout | from_json).Rules
