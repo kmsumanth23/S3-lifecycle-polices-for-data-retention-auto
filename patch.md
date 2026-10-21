@@ -120,9 +120,14 @@ grep -n "s3_bucket_name_prefix" aws-client-infra-provision-core/aws-client-vars-
 # edit 2
 grep -A8 "include tasks to manage the bucket lifecycle configuration" <root play>.yml
 
-# edit 3  - must print 0
-grep -c "{{ bucket_name }}" aws-client-infra-provision-core/tasks/aws-storage-bucket-lifecycle.yml
+# edit 3  - must print nothing at all
+grep -n "bucket_name" aws-client-infra-provision-core/tasks/aws-storage-bucket-lifecycle.yml \
+  | grep -v s3_lifecycle_bucket_name | grep -v s3_bucket_name_prefix
 ```
+
+Do not use `grep -c "{{ bucket_name }}"` for this. It returns 0 while
+`[bucket_name ~ '...']` style references are still present - that exact blind spot hid a
+bug in the preview path through two shipped revisions.
 
 Then the real check, which no grep can do - run with
 `{"s3_lifecycle_manage": true, "s3_lifecycle_check_only": true}` and confirm the
